@@ -56,15 +56,18 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void Enter_Sleep(void);
 void Enter_Stop2(void);
-void RTC_Set_Alarm(uint8_t sec);
+HAL_StatusTypeDef RTC_Set_Alarm(uint32_t sec);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void Enter_Sleep(void){
-	
+void Enter_Sleep(void)
+{	
+	//进入睡眠前挂起的滴答时钟
 	HAL_SuspendTick();
-	HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON,PWR_SLEEPENTRY_WFI);
+	//进入睡眠模式
+	HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+	//唤醒后恢复
 	HAL_ResumeTick();
 }
 
@@ -79,57 +82,85 @@ void Enter_Sleep(void){
 
 void Enter_Stop2(void)
 {
-    // 1. 关闭 LPUART（停止接收，禁用外设时钟）
-    HAL_UART_DeInit(&hlpuart1);          // 彻底复位 LPUART 外设
-    __HAL_RCC_LPUART1_CLK_DISABLE();     // 关闭 LPUART 总线时钟（可选，DeInit 已包含）
+    // ==========================
+    // 【新增】关闭非必要外设时钟（防止漏电）
+    // ==========================
+    __HAL_RCC_LPUART1_CLK_DISABLE();  // 如果你不用 LPUART 唤醒，就关掉
+    // 如果你还有其他外设（ADC/TIM/SPI），也在这里关掉
 
-    // 2. 进入 Stop2 模式
+    // 1. 挂起系统滴答
     HAL_SuspendTick();
-    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-    HAL_ResumeTick();
 
-    // 3. 从 Stop2 唤醒后，重新初始化 LPUART
-    MX_LPUART1_UART_Init();              // 重新配置 LPUART
-    HAL_UART_Receive_IT(&hlpuart1, &lpuart_buf, 1);  // 重新开启接收中断
+    // 2. 进入 STOP2 模式
+    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+
+    // 3. 唤醒后重配系统时钟
+    SystemClock_Config();
+
+    // ==========================
+    // 【新增】恢复外设（如果你需要用 LPUART）
+    // ==========================
+    MX_LPUART1_UART_Init();              // 重新初始化 LPUART
+    HAL_UART_Receive_IT(&hlpuart1, &lpuart_buf, 1);  // 重新开启接收
+
+    // 4. 恢复系统滴答
+    HAL_ResumeTick();
 }
 
-void RTC_Set_Alarm(uint8_t sec){
-    RTC_AlarmTypeDef sAlarm={0};
-    RTC_TimeTypeDef sTime={0};
-    
-    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-    
+HAL_StatusTypeDef RTC_Set_Alarm(uint32_t sec)
+{
+    RTC_AlarmTypeDef sAlarm = {0};
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
 
-    uint32_t newSeconds = sTime.Seconds + sec;
-    uint32_t newMinutes = sTime.Minutes;
-    uint32_t newHours = sTime.Hours;
-    
-    if (newSeconds >= 60) {
-        newMinutes += newSeconds / 60;
-        newSeconds %= 60;
-    }
-    
-    if (newMinutes >= 60) {
-        newHours += newMinutes / 60;
-        newMinutes %= 60;
-    }
-    
-    if (newHours >= 24) {
-        newHours %= 24;
+    if (sec == 0)
+    {
+        sec = 1;
     }
 
-    sAlarm.AlarmTime.Hours = newHours;
-    sAlarm.AlarmTime.Minutes = newMinutes;
-    sAlarm.AlarmTime.Seconds = newSeconds;
+    if (HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    if (HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    uint32_t totalSeconds = sTime.Hours * 3600
+                          + sTime.Minutes * 60
+                          + sTime.Seconds
+                          + sec;
+
+    totalSeconds %= 24 * 3600;
+
+    sAlarm.AlarmTime.Hours = totalSeconds / 3600;
+    sAlarm.AlarmTime.Minutes = (totalSeconds % 3600) / 60;
+    sAlarm.AlarmTime.Seconds = totalSeconds % 60;
     sAlarm.AlarmTime.SubSeconds = 0;
-    
-    sAlarm.Alarm = RTC_ALARM_A;
 
-    sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY | RTC_ALARMMASK_HOURS | RTC_ALARMMASK_MINUTES;
-    
-    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
-    
-    HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN);
+    sAlarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    sAlarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+
+    sAlarm.Alarm = RTC_ALARM_A;
+    sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+    sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+
+    sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+    sAlarm.AlarmDateWeekDay = 1;
+
+    if (HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    return HAL_OK;
 }
 
 /* USER CODE END 0 */
@@ -178,21 +209,16 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 		
-		// 1. Sleep
-		RTC_Set_Alarm(3);
-    Enter_Sleep();
+		if (RTC_Set_Alarm(30) == HAL_OK)
+    {
+        Enter_Sleep();
+				//Enter_Stop2();
+    }
+    else
+    {
+        Error_Handler();
+    }
 
-    // 3. Stop 2
-    RTC_Set_Alarm(3);
-    Enter_Stop2();
-
-    // 4. Stop 3
-    RTC_Set_Alarm(3);
-    Enter_Stop2();
-
-    // 5. Sleep
-		RTC_Set_Alarm(3);
-    Enter_Sleep();
   }
   /* USER CODE END 3 */
 }
@@ -221,16 +247,12 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE|RCC_OSCILLATORTYPE_LSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 12;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV4;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_9;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -240,7 +262,7 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
@@ -249,6 +271,10 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /** Enable MSI Auto calibration
+  */
+  HAL_RCCEx_EnableMSIPLLMode();
 }
 
 /* USER CODE BEGIN 4 */
